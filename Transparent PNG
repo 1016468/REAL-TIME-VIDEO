@@ -1,0 +1,62 @@
+import cv2
+import numpy as np
+from PIL import Image
+
+# Load the video
+cap = cv2.VideoCapture("/Users/tookd.photo/Documents/back.mp4")
+
+image_pil = Image.open("/Users/tookd.photo/Desktop/actual.png").convert("RGBA")
+overlay = np.array(image_pil)
+
+overlay = cv2.cvtColor(overlay, cv2.COLOR_RGBA2BGRA)
+
+# Scale down overlay while maintaining aspect ratio
+scale_factor = 0.2 #Size scale
+new_width = int(overlay.shape[1] * scale_factor)
+new_height = int(overlay.shape[0] * scale_factor)
+overlay = cv2.resize(overlay, (new_width, new_height))
+
+# Ensure the PNG has 4 channels
+if overlay.shape[2] == 3:  # If only BGR exists
+    overlay = cv2.cvtColor(overlay, cv2.COLOR_BGR2BGRA)  # Add an alpha channel
+
+# Extract the alpha channel (transparency)
+b, g, r, alpha = cv2.split(overlay)
+
+# Normalize alpha to range 0-1
+alpha = alpha.astype(float) / 255.0
+
+# Merge color channels without alpha
+overlay_color = cv2.merge((b, g, r))
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break  # End of video
+
+    # Define position (top-left corner)
+    x, y = 950, 50  # Adjust position as needed
+
+    # Get ROI from the frame
+    h, w, _ = overlay_color.shape
+    if y + h > frame.shape[0] or x + w > frame.shape[1]:
+        print("Overlay image exceeds frame boundaries. Adjust position or scale down overlay.")
+        break
+
+    roi = frame[y:y+h, x:x+w]
+
+    # Blend images using alpha channel
+    roi = roi.astype(float)
+    overlay_color = overlay_color.astype(float)
+
+    blended = (1 - alpha[..., None]) * roi + (alpha[..., None]) * overlay_color
+    frame[y:y+h, x:x+w] = blended.astype(np.uint8)
+
+    # Show result
+    cv2.imshow("Overlayed Video", frame)
+
+    if cv2.waitKey(30) & 0xFF == 27:  # Press ESC to exit
+        break
+
+cap.release()
+cv2.destroyAllWindows()
