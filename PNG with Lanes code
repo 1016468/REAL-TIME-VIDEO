@@ -1,0 +1,183 @@
+import cv2
+import numpy as np
+from PIL import Image
+
+# Global variables for lane persistence
+prev_left_line = None
+prev_right_line = None
+smoothing_alpha = 0.1  # Smoothing factor
+
+# Load overlay image
+image_pil = Image.open("/Users/tookd.photo/Desktop/actual.png").convert("RGBA")
+overlay = np.array(image_pil)
+overlay = cv2.cvtColor(overlay, cv2.COLOR_RGBA2BGRA)
+
+# Scale down overlay while maintaining aspect ratio
+scale_factor = 0.2  # Size scale
+new_width = int(overlay.shape[1] * scale_factor)
+new_height = int(overlay.shape[0] * scale_factor)
+overlay = cv2.resize(overlay, (new_width, new_height))
+
+# Ensure the PNG has 4 channels
+if overlay.shape[2] == 3:
+    overlay = cv2.cvtColor(overlay, cv2.COLOR_BGR2BGRA)
+
+# Extract the alpha channel (transparency)
+b, g, r, alpha = cv2.split(overlay)
+alpha = alpha.astype(float) / 255.0  # Normalize alpha to range 0-1
+overlay_color = cv2.merge((b, g, r))
+
+
+def undistort_frame(frame):
+    """Undistorts the frame using dummy camera calibration parameters."""
+    h, w = frame.shape[:2]
+    camera_matrix = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1]], dtype=np.float32)
+    dist_coeffs = np.zeros((5, 1), dtype=np.float32)
+    return cv2.undistort(frame, camera_matrix, dist_coeffs, None, camera_matrix)
+
+
+def region_of_interest(img, vertices):
+    """Applies a mask to keep only the region of interest."""
+    mask = np.zeros_like(img)
+    cv2.fillPoly(mask, vertices, 255)
+    return cv2.bitwise_and(img, mask)
+
+
+def detect_lanes(frame, prev_left, prev_right):
+    """Detects lane lines and ensures they stay within ROI."""
+    height, width = frame.shape[:2]
+    offset = int(0.05 * height)  # Move the ROI down by 10% of the frame height
+    roi_top = int(0.55 * height) + offset
+    roi_bottom = height - int(0.3 * height) + offset
+
+    roi_vertices = np.array([[
+        (int(0.1 * width), roi_bottom),  # Bottom-left
+        (int(0.1 * width), roi_top),  # Top-left
+        (int(0.65 * width), roi_top),  # Top-right
+        (int(0.65 * width), roi_bottom)  # Bottom-right
+    ]], dtype=np.int32)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    kernel = np.ones((9, 9), np.uint8)  # 5x5 kernel, you can adjust the size
+    dilated_edges = cv2.dilate(edges, kernel, iterations=1)  # Dilate the edges
+    cropped_edges = region_of_interest(dilated_edges, roi_vertices)
+
+    lines = cv2.HoughLinesP(cropped_edges, 1, np.pi / 180, threshold=50, minLineLength=50, maxLineGap=150)
+
+    left_lines, right_lines = [], []
+    if lines is not None:
+        for line in lines:
+            for x1, y1, x2, y2 in line:
+                if x2 - x1 == 0:
+                    continue
+                slope = (y2 - y1) / (x2 - x1)
+                if slope < -0.5:
+                    left_lines.append([x1, y1, x2, y2])
+                elif slope > 0.5:
+                    right_lines.append([x1, y1, x2, y2])
+
+    def average_line(lines):
+        """Averages multiple detected lane lines and clips to ROI."""
+        if len(lines) == 0:
+            return None
+        x_coords, y_coords = [], []
+        for line in lines:
+            x_coords.extend([line[0], line[2]])
+            y_coords.extend([line[1], line[3]])
+        poly = np.polyfit(y_coords, x_coords, 1)
+        slope, intercept = poly
+
+        y_bottom, y_top = roi_bottom, roi_top
+        x_bottom = int(slope * y_bottom + intercept)
+        x_top = int(slope * y_top + intercept)
+
+        return [x_bottom, y_bottom, x_top, y_top]
+
+    left_avg = average_line(left_lines)
+    right_avg = average_line(right_lines)
+
+    left_avg = left_avg if left_avg is not None else prev_left
+    right_avg = right_avg if right_avg is not None else prev_right
+
+    return left_avg, right_avg, roi_vertices
+
+
+def smooth_line(current, previous, alpha=smoothing_alpha):
+    """Applies exponential moving average for smoother lane lines."""
+    if current is None:
+        return previous
+    if previous is None:
+        return current
+    return (alpha * np.array(current) + (1 - alpha) * np.array(previous)).astype(int).tolist()
+
+
+def overlay_lanes(frame, left_line, right_line, roi_vertices):
+    """Draws lane lines clipped within the ROI boundaries."""
+    overlay = frame.copy()
+    cv2.polylines(overlay, [roi_vertices], isClosed=True, color=(0, 255, 255), thickness=2)
+
+    if left_line is not None:
+        cv2.line(overlay, (left_line[0], left_line[1]), (left_line[2], left_line[3]), (0, 255, 0), 5)
+    if right_line is not None:
+        cv2.line(overlay, (right_line[0], right_line[1]), (right_line[2], right_line[3]), (0, 255, 0), 5)
+
+    return overlay
+
+
+def add_overlay(frame):
+    """Adds a transparent overlay image to the video frame."""
+    x, y = 900, 50  # Position
+    h, w, _ = overlay_color.shape
+
+    if y + h > frame.shape[0] or x + w > frame.shape[1]:
+        print("Overlay image exceeds frame boundaries. Adjust position or scale down overlay.")
+        return frame
+
+    roi = frame[y:y+h, x:x+w].astype(float)
+    blended = (1 - alpha[..., None]) * roi + (alpha[..., None]) * overlay_color.astype(float)
+    frame[y:y+h, x:x+w] = blended.astype(np.uint8)
+
+    return frame
+
+
+def main():
+    global prev_left_line, prev_right_line
+
+    video_path = '/Users/tookd.photo/Documents/back.mp4'
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        print("Error: Could not open video.")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    wait_time = int(1000 / fps) if fps > 0 else 30
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame = undistort_frame(frame)
+        left_line, right_line, roi_vertices = detect_lanes(frame, prev_left_line, prev_right_line)
+
+        left_line = smooth_line(left_line, prev_left_line)
+        right_line = smooth_line(right_line, prev_right_line)
+
+        prev_left_line, prev_right_line = left_line, right_line
+
+        overlay_frame = overlay_lanes(frame, left_line, right_line, roi_vertices)
+        final_frame = add_overlay(overlay_frame)
+
+        cv2.imshow("Lane Detection + Overlay", final_frame)
+        if cv2.waitKey(wait_time) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
