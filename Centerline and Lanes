@@ -1,0 +1,314 @@
+import cv2
+import numpy as np
+from PIL import Image
+from skimage.morphology import skeletonize
+from skimage import img_as_ubyte
+from collections import deque
+from matplotlib import pyplot as plt
+
+# Global variables for smoothing and history
+prev_left = prev_right = prev_center = None
+smoothing_alpha = 0.1
+last_vp = None
+center_hist = deque(maxlen=30)
+
+def update_hist(center_line):
+    if center_line is not None:
+        center_hist.append(center_line)
+
+def predict_center(frame_h, poly_order=2):
+    if len(center_hist) < 5:
+        return None
+    xs, ys = [], []
+    for cl in center_hist:
+        xs.extend([cl[0], cl[2]])
+        ys.extend([cl[1], cl[3]])
+    coeff = np.polyfit(ys, xs, poly_order)
+    poly = np.poly1d(coeff)
+    y_vals = np.linspace(int(0.5 * frame_h), frame_h, num=50)
+    return [(int(poly(y)), int(y)) for y in y_vals]
+
+def undistort(frame):
+    h, w = frame.shape[:2]
+    mtx = np.array([[w, 0, w / 2],
+                    [0, w, h / 2],
+                    [0, 0, 1]], dtype=np.float32)
+    return cv2.undistort(frame, mtx, np.zeros((5, 1), np.float32), None, mtx)
+
+def roi(img, verts):
+    mask = np.zeros_like(img)
+    cv2.fillPoly(mask, verts, 255)
+    return cv2.bitwise_and(img, mask)
+
+def detect_lanes(frame):
+    h, w = frame.shape[:2]
+    bot_off = int(0.1 * h)
+    verts = np.array([[
+        (0, h - bot_off),
+        (int(0.1 * w), int(0.5 * h)),
+        (int(0.9 * w), int(0.5 * h)),
+        (w, h - bot_off)
+    ]], dtype=np.int32)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    cropped = roi(edges, verts)
+    lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=50, maxLineGap=150)
+
+    left_lines, right_lines = [], []
+    if lines is not None:
+        for l in lines:
+            for x1, y1, x2, y2 in l:
+                if x2 - x1 == 0:
+                    continue
+                slope = (y2 - y1) / (x2 - x1)
+                if slope < -0.5:
+                    left_lines.append([x1, y1, x2, y2])
+                elif slope > 0.5:
+                    right_lines.append([x1, y1, x2, y2])
+    if lines is None or (not left_lines and not right_lines):
+        return None, None, None, verts, False
+
+    def avg_line(lns):
+        if not lns:
+            return None
+        xs = [pt for line in lns for pt in (line[0], line[2])]
+        ys = [pt for line in lns for pt in (line[1], line[3])]
+        poly = np.polyfit(ys, xs, 1)
+        s, i = poly
+        yb, yt = h - bot_off, int(0.5 * h)
+        return [int(s * yb + i), yb, int(s * yt + i), yt]
+
+    left_avg = avg_line(left_lines)
+    right_avg = avg_line(right_lines)
+    default_left = [int(0.3 * w), h - bot_off, int(0.3 * w), int(0.5 * h)]
+    default_right = [int(0.7 * w), h - bot_off, int(0.7 * w), int(0.5 * h)]
+    if left_avg is None:
+        left_avg = default_left
+    if right_avg is None:
+        right_avg = default_right
+
+    center_line = [(left_avg[0] + right_avg[0]) // 2,
+                   (left_avg[1] + right_avg[1]) // 2,
+                   (left_avg[2] + right_avg[2]) // 2,
+                   (left_avg[3] + right_avg[3]) // 2]
+    return left_avg, right_avg, center_line, verts, True
+
+def detect_fallback(frame):
+    h, w = frame.shape[:2]
+    bot_off = int(0.1 * h)
+    ROI_TOP, ROI_BOTTOM = int(0.5 * h), h - bot_off
+    roi_frame = frame[ROI_TOP:ROI_BOTTOM, :]
+    gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (9, 9), 0), 50, 150)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    _, binary = cv2.threshold(edges, 50, 255, cv2.THRESH_BINARY)
+    skel = img_as_ubyte(skeletonize(binary // 255))
+    contours, _ = cv2.findContours(skel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) < 2:
+        return None
+    conts = sorted(contours, key=cv2.contourArea, reverse=True)[:2]
+    try:
+        curve1 = cv2.approxPolyDP(conts[0], 5, False).reshape(-1, 2)
+        curve2 = cv2.approxPolyDP(conts[1], 5, False).reshape(-1, 2)
+    except Exception:
+        return None
+    num_points = max(len(curve1), len(curve2))
+    t = np.linspace(0, 1, num_points)
+    curve1_rs = np.array([np.interp(t, np.linspace(0, 1, len(curve1)), curve1[:, i]) for i in range(2)]).T
+    curve2_rs = np.array([np.interp(t, np.linspace(0, 1, len(curve2)), curve2[:, i]) for i in range(2)]).T
+    midline = (curve1_rs + curve2_rs) / 2.0
+    midline[:, 1] += ROI_TOP
+    return [int(midline[-1, 0]), int(midline[-1, 1]),
+            int(midline[0, 0]), int(midline[0, 1])]
+
+def smooth_line(cur, prev, alpha=smoothing_alpha):
+    return (alpha * np.array(cur) + (1 - alpha) * np.array(prev)).astype(int).tolist()
+
+def vanishing_point(l_line, r_line):
+    if not l_line or not r_line:
+        return None
+    x1, y1, x2, y2 = l_line
+    x3, y3, x4, y4 = r_line
+    A1, B1, C1 = y2 - y1, x1 - x2, (y2 - y1) * x1 + (x1 - x2) * y1
+    A2, B2, C2 = y4 - y3, x3 - x4, (y4 - y3) * x3 + (x3 - x4) * y3
+    det = A1 * B2 - A2 * B1
+    if abs(det) < 1e-5:
+        return None
+    return (int((B2 * C1 - B1 * C2) / det), int((A1 * C2 - A2 * C1) / det))
+
+def perspective_transform(frame, l_line, r_line, verts):
+    global last_vp
+    h, w = frame.shape[:2]
+    if not l_line or not r_line:
+        src = np.float32(verts[0])
+    else:
+        vp = vanishing_point(l_line, r_line)
+        if vp is None:
+            vp = last_vp
+        margin = 50
+        thresh = int(0.5 * h)
+        if vp and vp[1] < thresh:
+            src = np.float32([[vp[0] - margin, vp[1]],
+                              [vp[0] + margin, vp[1]],
+                              [r_line[0], h],
+                              [l_line[0], h]])
+            last_vp = vp
+        else:
+            src = np.float32(verts[0])
+    dst = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(frame, M, (w, h))
+
+def overlay(frame, l_line, r_line, c_line, verts):
+    out = frame.copy()
+    cv2.polylines(out, [verts], True, (0, 255, 255), 3)
+    if l_line:
+        cv2.line(out, (l_line[0], l_line[1]), (l_line[2], l_line[3]), (0, 255, 0), 5)
+    if r_line:
+        cv2.line(out, (r_line[0], r_line[1]), (r_line[2], r_line[3]), (0, 255, 0), 5)
+    if c_line:
+        cv2.line(out, (c_line[0], c_line[1]), (c_line[2], c_line[3]), (255, 0, 0), 5)
+    return out
+
+def is_static(cur, prev, thresh=5):
+    if not cur or not prev:
+        return False
+    return abs(cur[0] - prev[0]) < thresh
+
+def center_line(l_line, r_line, static_left=False):
+    if not l_line or not r_line:
+        return None
+    if static_left:
+        return [(2 * l_line[0] + r_line[0]) // 3, (2 * l_line[1] + r_line[1]) // 3,
+                (2 * l_line[2] + r_line[2]) // 3, (2 * l_line[3] + r_line[3]) // 3]
+    return [(l_line[0] + r_line[0]) // 2, (l_line[1] + r_line[1]) // 2,
+            (l_line[2] + r_line[2]) // 2, (l_line[3] + r_line[3]) // 2]
+
+def rotate_overlay(overlay_color, alpha, angle):
+    """Rotate both the overlay image and its alpha channel by a given angle."""
+    (h, w) = overlay_color.shape[:2]
+    center_pt = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center_pt, angle, 1.0)
+    rot_color = cv2.warpAffine(overlay_color, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
+    rot_alpha = cv2.warpAffine(alpha, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
+    return rot_color, rot_alpha
+
+def main():
+    global prev_left, prev_right, prev_center
+
+    # Load the video
+    cap = cv2.VideoCapture("/Users/tookd.photo/Documents/otherbennet.mp4")
+    if not cap.isOpened():
+        print("Error: Could not open video.")
+        return
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    delay = int(1000 / fps) if fps > 0 else 30
+
+    # Load and prepare the PNG overlay image (arrow)
+    image_pil = Image.open("/Users/tookd.photo/Desktop/actual.png").convert("RGBA")
+    overlay_img = np.array(image_pil)
+    overlay_img = cv2.cvtColor(overlay_img, cv2.COLOR_RGBA2BGRA)
+    scale_factor = 0.2  # Scale size down
+    new_width = int(overlay_img.shape[1] * scale_factor)
+    new_height = int(overlay_img.shape[0] * scale_factor)
+    overlay_img = cv2.resize(overlay_img, (new_width, new_height))
+    if overlay_img.shape[2] == 3:
+        overlay_img = cv2.cvtColor(overlay_img, cv2.COLOR_BGR2BGRA)
+    b, g, r, a = cv2.split(overlay_img)
+    alpha = a.astype(np.float32) / 255.0  # Normalize alpha to 0-1
+    overlay_color = cv2.merge((b, g, r))
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Step 1: Preprocess frame
+        frame = undistort(frame)
+        h, w = frame.shape[:2]
+        bot_off = int(0.1 * h)
+
+        # Step 2: Lane detection
+        left, right, center, verts, valid = detect_lanes(frame)
+        if not valid or center is None:
+            fb = detect_fallback(frame)
+            if fb:
+                center = fb
+                left = prev_left if prev_left else [int(0.3 * w), h - bot_off, int(0.3 * w), int(0.5 * h)]
+                right = prev_right if prev_right else [int(0.7 * w), h - bot_off, int(0.7 * w), int(0.5 * h)]
+            else:
+                pred = predict_center(h)
+                if pred:
+                    center = [pred[0][0], pred[0][1], pred[-1][0], pred[-1][1]]
+                    for i in range(len(pred) - 1):
+                        cv2.line(frame, pred[i], pred[i + 1], (255, 0, 0), 5)
+                else:
+                    cv2.imshow("Lane Detection Overlay", frame)
+                    if cv2.waitKey(delay) & 0xFF == ord('q'):
+                        break
+                    continue
+        else:
+            update_hist(center)
+
+        default_left = [int(0.3 * w), h - bot_off, int(0.3 * w), int(0.5 * h)]
+        if (not left or left == default_left) and prev_left:
+            left = prev_left
+        static_left = is_static(left, prev_left) if prev_left and left else False
+        new_center = center_line(left, right, static_left)
+        if prev_left and left:
+            left = smooth_line(left, prev_left)
+        if prev_right and right:
+            right = smooth_line(right, prev_right)
+        center = smooth_line(new_center, prev_center, alpha=0.05) if prev_center and new_center else new_center
+        prev_left, prev_right, prev_center = left, right, center
+
+        # Compute turning angle from the centerline (using dx, dy)
+        discrete_angle = 0
+        if center is not None:
+            dx = center[2] - center[0]
+            dy = center[3] - center[1]
+            computed_angle = np.degrees(np.arctan2(dx, dy))
+            # Discretize: if computed_angle > 10, video turning right; if < -10, turning left.
+            if computed_angle > 160:
+                discrete_angle = 0  # Rotate 90° clockwise to point right
+            elif computed_angle < 140 and computed_angle > 120:
+                discrete_angle = 90   # Rotate 90° counterclockwise to point left
+            elif computed_angle < 158 and computed_angle > 149:
+                discrete_angle = -90    # Straight
+            else:
+                discrete_angle = 0
+
+        # Optional: get bird's-eye view if needed
+        warped = perspective_transform(frame, left, right, verts)
+        out_frame = overlay(frame, left, right, center, verts)
+
+        # Step 3: Rotate overlay based on the discrete turning angle
+        rotated_color, rotated_alpha = rotate_overlay(overlay_color, alpha, discrete_angle)
+
+        # Step 4: Overlay the rotated PNG image onto the processed frame
+        pos_x, pos_y = 950, 50  # Adjust position as needed
+        oh, ow, _ = rotated_color.shape
+        if pos_y + oh <= out_frame.shape[0] and pos_x + ow <= out_frame.shape[1]:
+            roi_region = out_frame[pos_y:pos_y+oh, pos_x:pos_x+ow].astype(np.float32)
+            oc = rotated_color.astype(np.float32)
+            # Expand rotated_alpha to 3 channels for blending
+            alpha_exp = cv2.merge([rotated_alpha, rotated_alpha, rotated_alpha])
+            blended = (1 - alpha_exp) * roi_region + alpha_exp * oc
+            out_frame[pos_y:pos_y+oh, pos_x:pos_x+ow] = blended.astype(np.uint8)
+        else:
+            print("Overlay image exceeds frame boundaries. Adjust position or scale down overlay.")
+
+        # Optionally, show the computed turning angle (for debugging)
+        cv2.putText(out_frame, f"Angle: {computed_angle:.1f} deg", (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+        cv2.imshow("Lane Detection Overlay", out_frame)
+        if cv2.waitKey(delay) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
