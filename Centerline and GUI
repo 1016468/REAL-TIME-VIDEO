@@ -32,6 +32,9 @@ import os
 ACCOUNTS_FILE = "accounts.json"
 
 
+
+
+
 def load_accounts():
     """Load user accounts from a JSON file.
 
@@ -164,6 +167,8 @@ def detect_lanes(frame):
     cropped = roi(edges, verts)
     # Adjusted HoughLinesP parameters: lower minLineLength and higher maxLineGap
     lines = cv2.HoughLinesP(cropped, 1, np.pi / 180, 50, minLineLength=20, maxLineGap=250)
+
+
 
     left_lines, right_lines = [], []
     if lines is not None:
@@ -476,7 +481,7 @@ def start_main_app():
     command_output.insert(tk.END, "Command output will appear here...\n")
 
     # Load video capture
-    video_path = "/Users/pl1016468/Desktop/otherbennet.mp4"  # Update path if needed
+    video_path = "/Users/pl1016468/Desktop/othervid.mp4"  # Update path if needed
     cap = cv2.VideoCapture(video_path)
 
     # Load and prepare the PNG overlay image (arrow)
@@ -561,12 +566,11 @@ def start_main_app():
                     discrete_angle = 0
                 elif 120 < computed_angle < 140:
                     discrete_angle = 90
-                elif 149 < computed_angle < 158:
+                elif 155 < computed_angle < 158:
                     discrete_angle = -90
                 else:
                     discrete_angle = 0
-                cv2.putText(frame_proc, f"Angle: {computed_angle:.1f} deg", (50, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
 
             # Optional: get bird's-eye view (perspective transform)
             warped = perspective_transform(frame_proc, left, right, verts)
